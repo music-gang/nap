@@ -1,0 +1,17 @@
+forwardAuth
+Dependabot
+distroless
+goreleaser
+Nomad
+Nops
+Nap
+Traefik
+Prometheus
+README
+SHAs
+[Aa]llocations?
+[Nn]amespaces?
+[Dd]eregister
+jobspecs?
+ACLs?
+dev

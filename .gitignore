@@ -1,0 +1,5 @@
+/dist/
+# Downloaded by `vale sync`.
+/.vale/Google/
+# Editor settings.
+/.vscode/

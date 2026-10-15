@@ -1,0 +1,136 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+      - name: go mod tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+      - run: go build ./...
+      - name: go vet
+        run: |
+          go vet ./...
+          go vet -tags integration ./...
+      - run: go test -race -cover ./...
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      # A tool in go.mod: Dependabot bumps it with the other modules.
+      - name: staticcheck
+        run: go tool staticcheck -tags integration ./...
+      # Prose lint of the docs with the Google style
+      # (docs/development.md#writing-docs).
+      # Pinned version and checksum: bump both by hand. Any alert fails the step.
+      - name: vale
+        env:
+          VALE_VERSION: "3.23.0"
+          VALE_SHA256: cc35445a45186b8f0b01e11c01359694cf941e72cf6ab0fc44774f0e54c9d5fc
+        run: |
+          tarball="vale_${VALE_VERSION}_Linux_64-bit.tar.gz"
+          curl -sSfLO "https://github.com/vale-cli/vale/releases/download/v${VALE_VERSION}/${tarball}"
+          echo "${VALE_SHA256}  ${tarball}" | sha256sum -c -
+          tar -xzf "${tarball}" vale
+          ./vale sync
+          ./vale --output=line docs README.md CONTRIBUTING.md > vale.out || true
+          cat vale.out
+          test ! -s vale.out
+
+  integration:
+    name: integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # The Nomad nap is tested against: the one place the version is set. The
+      # README states it too (a test in docs/ compares the two).
+      NOMAD_VERSION: "2.0.7"
+      NOMAD_SHA256: 4c9b8a0850d6fd9caadbbab09b3e6fdf8b77aa777729543c70c61b85acca68c1
+      NAP_TEST_NOMAD_ADDR: http://127.0.0.1:4646
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Install Nomad
+        run: |
+          zip="nomad_${NOMAD_VERSION}_linux_amd64.zip"
+          curl -sSfLO "https://releases.hashicorp.com/nomad/${NOMAD_VERSION}/${zip}"
+          echo "${NOMAD_SHA256}  ${zip}" | sha256sum -c -
+          unzip -q "${zip}" nomad
+          sudo install -m 0755 nomad /usr/local/bin/nomad
+          nomad version
+      # One agent, with ACLs: the tests set up on its management token.
+      - name: Start Nomad dev agent with ACLs
+        run: |
+          printf 'acl {\n  enabled = true\n}\n' > agent.hcl
+          nomad agent -dev -bind=127.0.0.1 -config=agent.hcl > nomad.log 2>&1 &
+          # The step's shell has no pipefail: the pipeline's status is jq's, so
+          # the loop looks at the token, not at the status.
+          token=""
+          for _ in $(seq 1 60); do
+            token=$(curl -sf -X POST "${NAP_TEST_NOMAD_ADDR}/v1/acl/bootstrap" | jq -r '.SecretID // empty')
+            if [ -n "${token}" ]; then break; fi
+            sleep 1
+          done
+          if [ -z "${token}" ]; then
+            echo "The agent could not be bootstrapped in time"
+            cat nomad.log
+            exit 1
+          fi
+          echo "::add-mask::${token}"
+          echo "NAP_TEST_NOMAD_TOKEN=${token}" >> "${GITHUB_ENV}"
+          for _ in $(seq 1 60); do
+            if curl -sf -H "X-Nomad-Token: ${token}" "${NAP_TEST_NOMAD_ADDR}/v1/nodes" | grep -q '"Status":"ready"'; then
+              echo "Nomad is ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Nomad did not become ready in time"
+          cat nomad.log
+          exit 1
+      - name: Integration tests
+        run: go test -tags integration -race -count=1 -v ./tests/integration/...
+      - name: Nomad log
+        if: failure()
+        run: tail -n 200 nomad.log
